@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mitchellh/go-ps"
 	"github.com/ochinchina/filechangemonitor"
 	"github.com/ochinchina/supervisord/config"
 	"github.com/ochinchina/supervisord/events"
@@ -162,8 +163,8 @@ func (p *Process) Start(wait bool) {
 	}
 
 	go func() {
-
 		for {
+			// we'll do retry start if it sets.
 			p.run(func() {
 				if wait {
 					runCond.L.Lock()
@@ -176,7 +177,7 @@ func (p *Process) Start(wait bool) {
 				time.Sleep(5 * time.Second)
 			}
 			if p.stopByUser {
-				log.WithFields(log.Fields{"program": p.GetName()}).Info("Stopped by user, don't start it again")
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("program stopped by user, don't start it again")
 				break
 			}
 			if !p.isAutoRestart() {
@@ -398,7 +399,7 @@ func (p *Process) getExitCodes() []int {
 func (p *Process) isRunning() bool {
 	if p.cmd != nil && p.cmd.Process != nil {
 		if runtime.GOOS == "windows" {
-			proc, err := os.FindProcess(p.cmd.Process.Pid)
+			proc, err := ps.FindProcess(p.cmd.Process.Pid)
 			return proc != nil && err == nil
 		}
 		return p.cmd.Process.Signal(syscall.Signal(0)) == nil
@@ -498,6 +499,16 @@ func (p *Process) waitForExit(startSecs int64) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	p.stopTime = time.Now()
+
+	// FIXME: we didn't set eventlistener logger
+	// since it's stdout/stderr has been specifically managed.
+	if p.StdoutLog != nil {
+		p.StdoutLog.Close()
+	}
+	if p.StderrLog != nil {
+		p.StderrLog.Close()
+	}
+
 }
 
 // fail to start the program
@@ -524,6 +535,13 @@ func (p *Process) monitorProgramIsRunning(endTime time.Time, monitorExited *int3
 	}
 }
 
+// 这个函数可能有以下几种执行完成的情况：
+//
+// 1. 程序正在运行中，因此函数直接返回。
+// 2. 程序尚未运行，函数开始尝试多次启动程序，直到启动成功。
+// 3. 程序成功启动并正在运行中，函数启动了一个后台监视程序来监视程序运行情况，并向 `finishCb` 函数传递一个标记告知程序已停止，函数直接返回。
+// 4. 程序启动失败，超出了尝试次数，函数将程序状态标记为 `FATAL`，并向 `finishCb` 函数传递一个标记告知程序已停止，函数直接返回。
+// 5. 程序被终止或运行失败，超出了重试次数，函数将程序状态标记为 `EXITED`，并向 `finishCb` 函数传递一个标记告知程序已停止，函数直接返回。
 func (p *Process) run(finishCb func()) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -533,8 +551,8 @@ func (p *Process) run(finishCb func()) {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("Don't start program because it is running")
 		finishCb()
 		return
-
 	}
+
 	p.startTime = time.Now()
 	atomic.StoreInt32(p.retryTimes, 0)
 	startSecs := p.getStartSeconds()
@@ -545,7 +563,8 @@ func (p *Process) run(finishCb func()) {
 	finishCbWrapper := func() {
 		once.Do(finishCb)
 	}
-	// process is not expired and not stoped by user
+
+	//process is not expired and not stoped by user
 	for !p.stopByUser {
 		if restartPause > 0 && atomic.LoadInt32(p.retryTimes) != 0 {
 			// pause
@@ -609,6 +628,7 @@ func (p *Process) run(finishCb func()) {
 		// Set startsec to 0 to indicate that the program needn't stay
 		// running for any particular amount of time.
 		if startSecs <= 0 {
+			atomic.StoreInt32(&monitorExited, 1)
 			log.WithFields(log.Fields{"program": p.GetName()}).Info("success to start program")
 			p.changeStateTo(Running)
 			go finishCbWrapper()
@@ -618,7 +638,7 @@ func (p *Process) run(finishCb func()) {
 				finishCbWrapper()
 			}()
 		}
-		log.WithFields(log.Fields{"program": p.GetName()}).Debug("wait program exit")
+		log.WithFields(log.Fields{"program": p.GetName()}).Debug("check program is starting and wait if it exit")
 		p.lock.Unlock()
 
 		procExitC := make(chan struct{})
@@ -648,10 +668,17 @@ func (p *Process) run(finishCb func()) {
 
 		p.lock.Lock()
 
-		// if the program still in running after startSecs
-		if p.state == Running {
-			p.changeStateTo(Exited)
-			log.WithFields(log.Fields{"program": p.GetName()}).Info("program exited")
+		// we break the restartRetry loop if:
+		// 1. process still in running after startSecs (although it's exited right now)
+		// 2. it's stopping by user (we unlocked before waitForExit, so the flag stopByUser will have a chance to change).
+		if p.state == Running || p.state == Stopping {
+			if !p.stopByUser {
+				p.changeStateTo(Exited)
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("program exited")
+			} else {
+				p.changeStateTo(Stopped)
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("program stopped by user")
+			}
 			break
 		} else {
 			p.changeStateTo(Backoff)
@@ -1028,8 +1055,10 @@ func (p *Process) Stop(wait bool) {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("program is not running")
 		return
 	}
-	log.WithFields(log.Fields{"program": p.GetName()}).Info("stop the program")
-	sigs := strings.Fields(p.config.GetString("stopsignal", "SIGTERM"))
+  
+	log.WithFields(log.Fields{"program": p.GetName()}).Info("stopping the program")
+	p.changeStateTo(Stopping)
+	sigs := strings.Fields(p.config.GetString("stopsignal", "TERM"))
 	waitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second
 	killwaitsecs := time.Duration(p.config.GetInt("killwaitsecs", 2)) * time.Second
 	stopasgroup := p.config.GetBool("stopasgroup", false)
@@ -1083,6 +1112,9 @@ func (p *Process) Stop(wait bool) {
 
 // GetStatus returns status of program as a string
 func (p *Process) GetStatus() string {
+	if p.cmd.ProcessState == nil {
+		return "<nil>"
+	}
 	if p.cmd.ProcessState.Exited() {
 		return p.cmd.ProcessState.String()
 	}
